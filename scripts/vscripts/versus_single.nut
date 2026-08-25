@@ -35,13 +35,13 @@ DirectorOptions <-
 	ShouldAllowSpecialsWithTank = true
 	ShouldAllowMobsWithTank = false
 	FallenSurvivorSpawnChance = 0
-	ZombieTankHealth = 2000
+	ZombieTankHealth = 3000
 	WitchLimit = 0
 	BehindSurvivorsSpawnDistance = 500
 	
 	weaponsToRemove = 
 	{
-		weapon_defibrillator = 0
+        weapon_defibrillator = 0
 		weapon_grenade_launcher = 0
 		weapon_upgradepack_incendiary = 0
 		weapon_upgradepack_explosive = 0
@@ -64,15 +64,15 @@ DirectorOptions <-
 		weapon_rifle_sg552		= "weapon_smg_silenced_spawn"
 		weapon_rifle_ak47		= "weapon_smg_silenced_spawn"
 		weapon_smg_mp5			= "weapon_smg_silenced_spawn"
-		weapon_sniper_military	= "weapon_hunting_rifle_spawn"
-		weapon_sniper_awp		= "weapon_hunting_rifle_spawn"
-		weapon_sniper_scout		= "weapon_hunting_rifle_spawn"
+        weapon_hunting_rifle    = "weapon_ammo_spawn"
+        weapon_sniper_military  = "weapon_ammo_spawn"
+		weapon_sniper_awp       = "weapon_ammo_spawn"
+		weapon_sniper_scout     = "weapon_ammo_spawn"
 	}
 	
 	botAvoidItems = 
 	{
 		// bots take only smg
-		weapon_hunting_rifle = true
 		weapon_shotgun_chrome = true
 		weapon_pumpshotgun = true
 	}
@@ -118,8 +118,13 @@ DirectorOptions <-
 
 function force_set_cvar()
 {
+	// 每回合重置 Damage Bonus 百分比与击倒记录
+	g_damage_bonus_pct = 100;
+	g_player_incapped = {};
+	g_incap_count = {};
+	// 每回合重置 H/D 打印基线
 	// shit! cvar in mode-file does not apply on developer mode!
-	
+
 	Convars.SetValue("sb_open_fire", 0);
 	Convars.SetValue("sb_unstick", 1);
 	
@@ -130,8 +135,8 @@ function force_set_cvar()
 	Convars.SetValue("survivor_limit", 4);
 	Convars.SetValue("z_max_player_zombies", 4);
 	Convars.SetValue("vs_max_team_switches", 99);
-	Convars.SetValue("vs_survival_bonus", 25);
-	Convars.SetValue("vs_tiebreak_bonus", 25);
+	update_bonus_cvar(false);
+	Convars.SetValue("vs_tiebreak_bonus", 0);
 	Convars.SetValue("nb_update_frequency", 0.033);
 	Convars.SetValue("director_vs_convert_pills", 0);
 	Convars.SetValue("director_convert_pills", 0);
@@ -154,13 +159,14 @@ function force_set_cvar()
 	Convars.SetValue("sb_separation_range", 300);
 	
 	
-	Convars.SetValue("versus_special_respawn_interval", 33);
+	Convars.SetValue("versus_special_respawn_interval", 30);
 	Convars.SetValue("z_mob_spawn_min_size", 25);
 	Convars.SetValue("z_mob_spawn_max_size", 25);
 	Convars.SetValue("z_fallen_max_count", 0);
 	Convars.SetValue("sv_infected_ceda_vomitjar_probability", 0);
 	Convars.SetValue("z_mob_spawn_min_interval_normal", 100);
 	Convars.SetValue("z_mob_spawn_max_interval_normal", 100);
+    Convars.SetValue("z_tank_health", 3000);
 	Convars.SetValue("z_ghost_delay_min", 1);
 	Convars.SetValue("z_ghost_delay_max", 1);
 	Convars.SetValue("gascan_spit_time", 2);
@@ -199,7 +205,7 @@ function force_set_cvar()
 	Convars.SetValue("z_smoker_limit", 1);
 	Convars.SetValue("z_max_stagger_duration", 0.9);
 	Convars.SetValue("z_ghost_los_expected_progress", 2000);
-	Convars.SetValue("tongue_choke_damage_amount", 5);
+	Convars.SetValue("tongue_choke_damage_amount", 4);
 	Convars.SetValue("tongue_break_from_damage_amount", 300);
 }
 
@@ -241,24 +247,258 @@ g_round_end <- false
 BOT_STOP_DELAY <- 20.0
 g_round_end <- false;
 
+// v26.11/26.12：每关开局给每名生还者一瓶止痛药（生成实体 + Use 拾取，复用 get_remote_pills 已验证机制）
+// v26.12：单人生成给药（player_first_spawn 主通道调用；SpawnEntityFromTable 为 dll 绑定 API）
+function give_pills_to(p)
+{
+	if (!p || !p.IsValid()) return;
+	local pills = SpawnEntityFromTable("weapon_pain_pills", { origin = p.GetOrigin() });
+	if (pills) {
+		DoEntFire("!self", "Use", "", 0.0, p, pills);
+	}
+}
+
+function give_start_pills()
+{
+	local ent = null;
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (ent && ent.IsPlayer() && ent.IsSurvivor() && !ent.IsDead()) {
+			give_pills_to(ent);
+		}
+	}
+}
+
+g_pills_delay <- 0.0   // v26.12：round_start 延迟补发计时（帧循环执行）
+
 function OnGameEvent_round_start( params )
 {
 	g_round_end <- false;
+	give_start_pills();          // v26.11 保留（即时尝试，可能时机过早）
+	g_pills_delay <- Time() + 1.0;   // v26.12：1 秒后补发（等玩家就位）
 	debug_print("round start");
 	force_set_cvar();
 	reset_triggers();
 	reset_bot_target();
 	si_reset();
+	surv_stuck_reset();   // v26.14：清空 bot 卡死检测记录
 	remove_entity();
 	Convars.SetValue("sb_stop", 1);
 	g_bot_start = false;
 	g_bot_start_time = Time() + BOT_STOP_DELAY;
 }
+// ===== ZoneMod 官方计分 =====
+// 总分 = 路程分 + (HealthBonus + DamageBonus) × 存活倍率
+// HealthBonus = 1.5×路程分×(永久血量/400)
+// v26.13：HealthBonus 的"永久血量"不含倒地血量（倒地时 GetHealth()=300 倒地池，实血上限 100）
+// DamageBonus = 0.5×路程分×百分比（初始100%；非倒地且受伤后实血=1→扣伤害×(1/4)；每次击倒→-12%；击倒后未救起而死亡→-12%；第3次击倒直接死亡→同样-12%）
+// 引擎结算 = cvar × 存活人数 → cvar = (H+D)/4
+// 定时输出（15 秒 + 通关时）：[VS Single] Dist:x HB:y<血量%> DB:z<pct%> Bonus:H+D
+// PillBonus 已取消：L4D2 vscripts 无背包 API 且事件无法追踪消耗，计数不可靠
+// 注意：L4D2 vscripts 没有 math 库，取整一律用 .tointeger()
+FLOW_TO_SCORE_SCALE <- 65.536 // 兜底换算：路程分 = flow × 1000/65536（即 flow ÷ 65.536）
+// 官方 vs 路程分满分（地图 mission 配置 VersusCompletionScore 键值，已从本地 vpk 实证全部 57 图：
+// c1-c5 主 pak01_dir.vpk，c6-c14 在 update/pak01_dir.vpk（Last Stand 更新包））
+VS_COMPLETION_SCORE <- {
+	c1m1_hotel = 500, c1m2_streets = 600, c1m3_mall = 700, c1m4_atrium = 800,
+	c2m1_highway = 400, c2m2_fairgrounds = 500, c2m3_coaster = 600, c2m4_barns = 700, c2m5_concert = 800,
+	c3m1_plankcountry = 500, c3m2_swamp = 600, c3m3_shantytown = 700, c3m4_plantation = 800,
+	c4m1_milltown_a = 400, c4m2_sugarmill_a = 500, c4m3_sugarmill_b = 600, c4m4_milltown_b = 700, c4m5_milltown_escape = 800,
+	c5m1_waterfront = 400, c5m2_park = 500, c5m3_cemetery = 600, c5m4_quarter = 700, c5m5_bridge = 800,
+	c6m1_riverbank = 500, c6m2_bedlam = 600, c6m3_port = 700,
+	c7m1_docks = 500, c7m2_barge = 600, c7m3_port = 700,
+	c8m1_apartment = 400, c8m2_subway = 500, c8m3_sewers = 600, c8m4_interior = 700, c8m5_rooftop = 800,
+	c9m1_alleys = 500, c9m2_lots = 600,
+	c10m1_caves = 400, c10m2_drainage = 500, c10m3_ranchhouse = 600, c10m4_mainstreet = 700, c10m5_houseboat = 800,
+	c11m1_greenhouse = 400, c11m2_offices = 500, c11m3_garage = 600, c11m4_terminal = 700, c11m5_runway = 800,
+	c12m1_hilltop = 400, c12m2_traintunnel = 500, c12m3_bridge = 600, c12m4_barn = 700, c12m5_cornfield = 800,
+	c13m1_alpinecreek = 500, c13m2_southpinestream = 600, c13m3_memorialbridge = 700, c13m4_cutthroatcreek = 800,
+	c14m1_junkyard = 800, c14m2_lighthouse = 1000,
+	// ===== 创意工坊地图（31 VPK，map 名来自 mission txt；无官方 score 的图默认 500）=====
+	// dark carnival remix
+	dkr_m1_motel = 500, dkr_m2_carnival = 500, dkr_m3_tunneloflove = 500, dkr_m4_ferris = 500, dkr_m5_stadium = 700,
+	// snow_town
+	snowtown_m1 = 300, snowtown_m2 = 500, snowtown_m3 = 700, snowtown_m4 = 600, snowtown_m5 = 800,
+	// dead_center_2025
+	dc2025_1 = 500, dc2025_2 = 800, dc2025_3 = 600, dc2025_4 = 700,
+	// dead center rebirth fixed
+	dcr_m1_hotel = 500, dcr_m2_streets = 600, dcr_m3_mall = 700, dcr_m4_atrium = 600,
+	// parish overgrowth
+	pr1_waterfront_f = 300, pr2_park_f = 500, pr3_highway_f = 600, pr4_quarter_f = 700, pr5_bridge_f = 700,
+	// noecho
+	noecho_m1 = 400, noecho_m2 = 600, noecho_m3 = 600, noecho_m4 = 600, noecho_m5 = 700,
+	// outline
+	outline_m1 = 300, outline_m2 = 600, outline_m3 = 600, outline_m4 = 600,
+	// nomercyrehab
+	nmrm1_apartment = 400, nmrm2_subway = 500, nmrm3_sewers = 600, nmrm4_hospital = 600, nmrm5_rooftop = 800,
+	// ccrerouted
+	ccr1_alleys = 300, ccr2_lots = 500, ccr3_factories = 600, ccr4_waterworks = 700, ccr5_storage_f = 700,
+	// dead center reconstructed
+	dcr1_meetup_f = 300, dcr2_thevannha_f = 500, dcr3_streets_f = 600, dcr4_mallentrance_f = 700, dcr5_mall_f = 700,
+	// dead_air_redux_aw
+	daredux_map1_docks_aw = 400, daredux_map2_houses_aw_test2 = 600, daredux_map4_offices_aw = 500, daredux_map5_garage_aw = 600, daredux_map6_terminal_aw = 700, daredux_runway_aw = 200,
+	// deadbeforedawn2_dc
+	l4d_dbd2dc_anna_is_gone = 400, l4d_dbd2dc_the_mall = 500, l4d_dbd2dc_clean_up = 600, l4d_dbd2dc_undead_center = 700, l4d_dbd2dc_new_dawn = 800, l4d_deadline02 = 500, l4d_dbd2_undead_center = 500,
+	// daybreak_v3
+	l4d2_daybreak01_hotel = 400, l4d2_daybreak02_coastline = 500, l4d2_daybreak03_bridge = 600, l4d2_daybreak04_cruise = 700, l4d2_daybreak05_rescue = 800,
+	// ihatemountains2
+	l4d_ihm01_forest = 400, l4d_ihm02_manor = 500, l4d_ihm03_underground = 600, l4d_ihm04_lumberyard = 700, l4d_ihm05_lakeside = 800,
+	// suicideblitz2
+	l4d2_stadium1_apartment = 400, l4d2_stadium2_riverwalk = 500, l4d2_stadium3_city1 = 600, l4d2_stadium4_city2 = 700, l4d2_stadium5_stadium = 800, l4d2_vs_stadium2_riverwalk = 500, l4d2_sv_stadium2_riverwalk = 500, l4d2_sv_stadium3_city1 = 500, l4d2_sv_stadium4_city2 = 500,
+	// cmpn_FatalFreightFix
+	l4d2_ff01_woods = 400, l4d2_ff02_factory = 500, l4d2_ff03_highway = 600, l4d2_ff04_plant = 700, l4d2_ff05_station = 800,
+	// energycrisis
+	ec01_outlets = 400, ec02_dam = 500, ec03_village = 600, ec04_powerstation = 800, ec05_quarry = 800,
+	// downpour
+	dprm1_milltown_a = 500, dprm2_sugarmill_a = 600, dprm3_sugarmill_b = 600, dprm4_milltown_b = 400, dprm5_milltown_escape = 600,
+	// deathsentence
+	death_sentence_1 = 400, death_sentence_2 = 500, death_sentence_3 = 600, death_sentence_4 = 700, death_sentence_5 = 800,
+	// tourofterror（全部无官方 score，默认 500）
+	eu01_residential_b16 = 500, eu02_castle_b16 = 500, eu03_oldtown_b16 = 500, eu04_freeway_b16 = 500, eu05_train_b16 = 500, sv_eu_park_b02 = 500, sv_eu_castle_b01 = 500, sv_eu_courtyard_b03 = 500, sv_eu_freeway_b01 = 500,
+	// deadbeatescape
+	deadbeat01_forest = 500, deadbeat02_alley = 600, deadbeat03_street = 700, deadbeat04_park = 800,
+	// hauntedforest_v3
+	hf01_theforest = 500, hf02_thesteeple = 600, hf03_themansion = 700, hf04_escape = 800,
+	// bloodtracks
+	bloodtracks_01 = 600, bloodtracks_02 = 700, bloodtracks_03 = 800, bloodtracks_04 = 800,
+	// detourahead
+	cdta_01detour = 500, cdta_02road = 600, cdta_03warehouse = 700, cdta_04onarail = 800, cdta_05finalroad = 800,
+	// city17l4d2
+	l4d2_city17_01 = 400, l4d2_city17_02 = 500, l4d2_city17_03 = 600, l4d2_city17_04 = 700, l4d2_city17_05 = 800,
+	// l4d2_diescraper_362
+	l4d2_diescraper1_apartment_361 = 500, l4d2_diescraper2_streets_361 = 700, l4d2_diescraper3_mid_361 = 700, l4d2_diescraper4_top_361 = 800,
+	// carriedoff
+	cwm1_intro = 500, cwm2_warehouse = 600, cwm3_drain = 700, cwm4_building = 800,
+	// openroad
+	x1m1_cliffs = 400, x1m2_path = 500, x1m3_city = 600, x1m4_forest = 700, x1m5_salvation = 800, x1m6_aftermath = 500,
+	// tripday
+	tripday_new_m1 = 300, tripday_new_m2 = 500, tripday_new_m3 = 600, tripday_new_m4 = 500, tripday_new_m5 = 600,
+	// undead_zone
+	uz_crash = 400, uz_town = 500, uz_desert = 600, uz_bunker = 700, uz_escape = 800,
+	// deathaboard2
+	l4d_deathaboard01_prison = 400, l4d_deathaboard02_yard = 500, l4d_deathaboard03_docks = 600, l4d_deathaboard04_ship = 700, l4d_deathaboard05_light = 800, l4d_sv_deathaboard_ship = 500
+}
+// map 名小写归一化（mission/引擎大小写不一：如 DCR1_meetup_F vs dcr1_meetup_f.bsp）
+function vs_map_lower(s)
+{
+	if (!s) return "";
+	local out = "";
+	for (local i = 0; i < s.len(); i++) {
+		local c = s[i];
+		if (c >= 65 && c <= 90) c += 32; // A-Z -> a-z
+		out += c.tochar();
+	}
+	return out;
+}
+DAMAGE_BONUS_DMG_PCT <- 1.0 / 4.0 // 受伤扣减：伤害 × 1/4（每 4 点伤害扣 1% DB）
+DAMAGE_BONUS_INCAP_PCT <- 12.0    // 每次击倒扣减（含第 1 次）
+DAMAGE_BONUS_DEATH_PCT <- 12.0    // 击倒后未被救起而死亡的额外扣减
+g_bonus_update_time <- 0
+BONUS_UPDATE_INTERVAL <- 1.0
+g_bonus_chat_time <- 0
+BONUS_CHAT_INTERVAL <- 5.0
+// v26.13：L4D2 实血上限 100；倒地时 GetHealth() 返回 300 点倒地池
+// 倒地判定：g_player_incapped 标记为主（覆盖倒地池任意值 300→0），血量阈值 >100 仅作标记漏维护时的兜底
+INCAPPED_HEALTH_THRESHOLD <- 100.0
+
+function update_bonus_cvar(chat = false, force_max = false)
+{
+	local ent = null;
+	local alive = 0;
+	local sum_health = 0.0;
+	local max_flow = 0.0;
+	// 官方路程分 = 官方进度百分比 × 该图满分（percent 含 finale 任务进度、通关封顶 100%）
+	// getroottable() 检查函数存在性：vscript 无 try/catch，直接调用不存在的函数会抛错阻断
+	local use_pct = ("GetCurrentFlowPercentForPlayer" in getroottable());
+	local max_pct = 0.0;
+	local human_max_pct = 0.0;   // v26.2：真人玩家最远 percent（官方路程分含 finale 任务进度，bots 只返回位置值）
+	local human_ok = false;      // 是否有可统计的真人幸存者
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (ent && ent.IsPlayer() && ent.IsSurvivor() && !ent.IsDead() && ent.GetHealth() > 0) {
+			alive += 1;
+			// v26.13：排除倒地血量——倒地时 GetHealth()=300 倒地池，计入会虚增 HB 导致结算异常
+			// 判定：标记表（player_incapacitated→true / revive_success、defibrillate→false）为主，
+			// 血量阈值 >100 兜底（实血上限 100；标记漏维护时仍能识别倒地池）
+			local id = ent.GetPlayerUserId();
+			local incapped = (id in g_player_incapped) && g_player_incapped[id];
+			if (!incapped && ent.GetHealth() > INCAPPED_HEALTH_THRESHOLD) {
+				incapped = true;
+			}
+			if (!incapped) {
+				sum_health += ent.GetHealth();
+			}
+			local flow = GetCurrentFlowDistanceForPlayer(ent);
+			if (flow > max_flow) {
+				max_flow = flow;
+			}
+			if (use_pct) {
+				local pct = GetCurrentFlowPercentForPlayer(ent);
+				if (pct > max_pct) {
+					max_pct = pct;
+				}
+				// v26.2：真人玩家优先——finale 任务进度只计入真人（v26.1 实测 700+ = bots 位置 88% 覆盖了真人任务进度 10%）
+				if (!IsPlayerABot(ent)) {
+					human_ok = true;
+					if (pct > human_max_pct) {
+						human_max_pct = pct;
+					}
+				}
+			}
+		}
+	}
+	// 兜底：无满分表的地图（创意工坊图等）或 percent API 不可用 → 旧 flow 换算
+	local dist = max_flow / FLOW_TO_SCORE_SCALE;
+	if (force_max) {
+		// v26.4：通关结算强制 = 图满分（round_end 时还有存活幸存者 = 通关；全灭失败 alive=0 不触发）
+		local mkey = vs_map_lower(g_map_name);
+		if (alive > 0 && mkey in VS_COMPLETION_SCORE) {
+			dist = VS_COMPLETION_SCORE[mkey] * 1.0;
+			debug_print(format("round end: force max dist=%d alive=%d", dist.tointeger(), alive));
+		}
+	} else if (use_pct) {
+		// v26.2：真人玩家优先，无真人幸存者（死亡/特感队）时回退全队（v26.1 行为）
+		local pct = human_ok ? human_max_pct : max_pct;
+		if (pct > 0) {
+			// 地图名复用 g_map_name（player_first_spawn 事件参数，mod 已验证可用；GetMapName() 在 L4D2 vscript 不可用——v26 实测崩点）
+			local mkey = vs_map_lower(g_map_name);
+			if (mkey in VS_COMPLETION_SCORE) {
+				if (pct > 1.0) {
+					pct = pct / 100.0; // 自适应：percent 实测为 0-100 制时归一化到 0-1
+				}
+				dist = pct * VS_COMPLETION_SCORE[mkey];
+			}
+		}
+	}
+	local health_bonus = 0.0;
+	local damage_bonus = 0.0;
+	if (alive > 0 && dist > 0) {
+		health_bonus = 1.5 * dist * (sum_health / 400.0);
+		damage_bonus = 0.5 * dist * (g_damage_bonus_pct / 100.0);
+	}
+	local total = (health_bonus + damage_bonus) * (alive / 4.0);
+	local cvar = 0;
+	if (alive > 0) {
+		cvar = (total / alive).tointeger();
+	}
+	Convars.SetValue("vs_survival_bonus", cvar);
+	if (chat) {
+		// ClientPrint 聊天栏输出（无 "Console:" 前缀；Say 带前缀，ScriptPrintMessageChatAll 在 L4D2 不可用）
+		ClientPrint(null, DirectorScript.HUD_PRINTTALK,
+			format("[VS Single] Dist:%d HB:%.0f<%.0f%%> DB:%.0f<%d%%> Bonus:%.0f",
+				dist.tointeger(), health_bonus, sum_health / 4.0, damage_bonus, g_damage_bonus_pct,
+				health_bonus + damage_bonus));
+	}
+}
+
 function OnGameEvent_round_end(params)
 {
 	g_round_end <- true;
 	debug_print("round end");
+	update_bonus_cvar(false);
+	// v26.4：不再依赖 winner 参数（vs 模式 winner 值实测不可靠）——force_max 在函数内以 alive>0 判定通关；失败（alive=0）自动走途中值
+	update_bonus_cvar(true, true);
 }
+
+// ===== PillBonus 已取消（L4D2 vscripts 无法可靠追踪药瓶持有数）=====
 function OnGameEvent_charger_charge_start( params )
 {
 	set_charge(params.userid);
@@ -280,6 +520,10 @@ function OnGameEvent_player_first_spawn( params)
 		g_map_name = params.map_name;
 		debug_print(format("--- map: %s", g_map_name));
 	}
+	// v26.12：生成即给药（主通道，玩家一定存在）
+	if (player && player.IsPlayer() && player.IsSurvivor()) {
+		give_pills_to(player);
+	}
 	if (player && player.IsPlayer() && IsPlayerABot(player) && !player.IsSurvivor() && player.GetZombieType() != ZC_TANK) {
 		g_si_pos[params.userid] <- player.GetOrigin();
 		g_si_pos_check_time[params.userid] <- Time();
@@ -299,6 +543,21 @@ function OnGameEvent_player_death( params )
 	if ("userid" in params) {
 		unset_charge(params.userid);
 		local player = GetPlayerFromUserID(params.userid);
+		// ZoneMod Damage Bonus：击倒后未被救起而死亡 → -12%；第 3 次击倒（直接死亡，击倒数≥2）→ 同样 -12%
+		if (player && player.IsPlayer() && player.IsSurvivor()) {
+			local id = player.GetPlayerUserId();
+			local flagged = (id in g_player_incapped) && g_player_incapped[id];
+			local cnt = (id in g_incap_count) ? g_incap_count[id] : 0;
+			// flag 路径覆盖"倒地未救起死亡"；cnt>=2 且未标记覆盖"第 3 次击倒直接死亡"
+			// （若引擎对第 3 次击倒也触发 incap 事件，flag=true 且 cnt=3 → 第一条不满足，不重复扣）
+			if ((flagged && cnt < 3) || (!flagged && cnt >= 2)) {
+				g_damage_bonus_pct -= DAMAGE_BONUS_DEATH_PCT;
+				if (g_damage_bonus_pct < 0) {
+					g_damage_bonus_pct = 0;
+				}
+			}
+			surv_stuck_clear(id);   // v26.14：清除死亡 bot 的卡死记录
+		}
 		if (params.userid in g_si_pos) {
 			g_si_pos[params.userid] <- null;
 			g_si_pos_check_time[params.userid] <- null;
@@ -306,7 +565,6 @@ function OnGameEvent_player_death( params )
 		if (player.IsSurvivor() && !IsPlayerABot(player) && !g_round_end) {
 			local bots = survivor_bots();
 			if (bots.len() > 0) {
-				Say(null, "try takecontrol", false);
 				takecontrol(player);
 			}
 		}
@@ -328,9 +586,65 @@ function OnGameEvent_player_hurt( params )
 	if (("attackerentid" in params) && player && player.IsPlayer() && !player.IsSurvivor() && player.GetZombieType() != ZC_TANK && IsPlayerABot(player)) {
 		si_bot_hurt(player);
 	}
+	// ZoneMod Damage Bonus：非倒地且受伤后实血≤1 → 扣 伤害×(1/4)；倒地受击不扣
+	if (player && player.IsPlayer() && player.IsSurvivor()) {
+		local id = player.GetPlayerUserId();
+		local hp = ("health" in params) ? params.health : -1;
+		local dmg = ("dmg_health" in params) ? params.dmg_health : -1;
+		if (!player.IsIncapacitated() && hp == 1 && dmg >= 0) {
+			g_damage_bonus_pct -= dmg * DAMAGE_BONUS_DMG_PCT;
+			if (g_damage_bonus_pct < 0) {
+				g_damage_bonus_pct = 0;
+			}
+		}
+		// v26.13：删除原"救起回退信号"（marked && hp>1 即清标记）——倒地受击时 health=倒地池 300-dmg 也 >1，
+		// 会误清标记导致倒地血量重新计入 HB；救起检测完全依赖 revive_success/defibrillate 事件（DB 系统实战验证可靠）
+	}
 }
 
-DMG_BOT_TANK <- 12.0
+// ZoneMod Damage Bonus 百分比跟踪
+g_damage_bonus_pct <- 100
+g_player_incapped <- {}
+g_incap_count <- {} // 每回合累计击倒数（第 3 次击倒=直接死亡）
+
+function OnGameEvent_player_incapacitated(params)
+{
+	local player = GetPlayerFromUserID(params.userid);
+	if (player && player.IsPlayer() && player.IsSurvivor()) {
+		local id = player.GetPlayerUserId();
+		g_damage_bonus_pct -= DAMAGE_BONUS_INCAP_PCT;   // 每次击倒（含第 1 次）
+		if (g_damage_bonus_pct < 0) {
+			g_damage_bonus_pct = 0;
+		}
+		g_player_incapped[id] <- true;                  // 标记：倒地未救起（死亡规则用）
+		// 累计击倒数（第 3 次击倒=直接死亡，死亡规则用）
+		if (id in g_incap_count) {
+			g_incap_count[id] += 1;
+		} else {
+			g_incap_count[id] <- 1;
+		}
+	}
+}
+
+// ZoneMod Damage Bonus：救起（手动/除颤）→ 清除"倒地未救起"标记
+function OnGameEvent_revive_success(params)
+{
+	if ("subject" in params) {
+		local player = GetPlayerFromUserID(params.subject);
+		if (player && player.IsPlayer()) {
+			local id = player.GetPlayerUserId();
+			g_player_incapped[id] <- false;
+		}
+	}
+}
+
+function OnGameEvent_defibrillate(params)
+{
+	// 除颤也走 revive_success 时此函数不触发；保险起见同样处理
+	OnGameEvent_revive_success(params);
+}
+
+DMG_BOT_TANK <- 16.0
 DMG_BOT_TANK_CAR <- 30.0
 function AllowTakeDamage( damageTable )
 {
@@ -1935,6 +2249,230 @@ g_si_pos_check_time <- {}
 STUCK_TIMER <- 10.0
 STUCKED_DETECT_TIME <- 30.0
 STUCK_RADIUS <- 50.0
+
+// ===== v26.14：幸存者 bot 机关快速自动触发（通用机制，不依赖地图硬编码）=====
+// v26.14 调整：检测半径 250→350；触发延迟 1s→立即；重试冷却 20→5→0.5；门批量 Open（双开门）；
+//              门类延迟 3s 判定（普通门 bot 原生 AI 会自己开，不触发；3s 仍不开才是机关门/警报门）
+// 目标：bot 到达机关（开关/对讲机/电台/警报门）附近立即自动触发，保证地图推进
+// 流程：flow 停滞检测(0.5s tick) → 实体扫描(350 半径) → 触发(Press/Use/Open) → 反馈验证
+//       → 机关无效(3 次)引导离开 → 极端(150s)传送/重生兜底
+SURV_STUCK_TICK <- 0.5            // 检测周期（秒）
+SURV_STUCK_FLOW_MIN <- 60.0       // tick 间 flow 推进阈值（0.5s 内正常走路 ~125）
+SURV_STUCK_TRIGGER_TIME <- 0.0    // 停滞立即尝试触发机关（响应延迟 = 检测周期 0.5s）
+SURV_STUCK_NEAR_RADIUS <- 350.0   // 机关实体扫描半径（v26.14 调整：250→350）
+SURV_STUCK_DOOR_DELAY <- 3.0      // v26.14 门类专用延迟：停滞 3s 仍未开门才视为机关门（普通门原生 AI 会自己开，不触发）
+SURV_STUCK_HUMAN_RANGE <- 500.0   // 真人优先半径（仅 SURV_STUCK_HUMAN_PRIORITY=true 时生效；真人离开即恢复 bot 触发）
+SURV_STUCK_INTERACT_CD <- 0.5    // 触发重试节流（v26.14 调整：20→5→0.5，几乎每个检测周期都尝试触发）
+SURV_STUCK_MAX_TRIGGERS <- 3      // 同机关最多触发次数
+SURV_STUCK_GUIDE_TIME <- 40.0     // 机关无效后引导离开
+SURV_STUCK_RESCUE3 <- 150.0       // 传送/重生兜底
+SURV_STUCK_AUTO_TRIGGER <- true   // 总开关
+SURV_STUCK_HUMAN_PRIORITY <- false // 真人优先（默认关=纯快速模式；第三方 finale 图提前触发严重时改 true）
+g_surv_stuck <- {}                // [userid] -> { last_flow, last_time, state, state_time, trigger_count, interact_time }
+g_surv_stuck_time <- 0
+
+function surv_stuck_reset()
+{
+	g_surv_stuck <- {};
+}
+
+function surv_stuck_clear(id)
+{
+	if (id in g_surv_stuck) {
+		delete g_surv_stuck[id];
+	}
+}
+
+// 扫描 bot 附近最近的可互动机关实体；返回 { ent, type } 或 null
+// type: "button"→Press / "use"→Use / "door"→Open（含警报门，用户确认接受）
+function surv_stuck_find_entity(bot)
+{
+	local bot_pos = bot.GetOrigin();
+	local best = null;
+	local best_dist = SURV_STUCK_NEAR_RADIUS;
+	local classes = ["func_button", "func_useable", "prop_radio",
+		"func_door", "prop_door", "func_door_rotating", "prop_door_rotating"];
+	foreach (cls in classes) {
+		local ent = null;
+		while (ent = Entities.FindByClassname(ent, cls)) {
+			if (!ent || !ent.IsValid()) continue;
+			local dist = (ent.GetOrigin() - bot_pos).Length();
+			if (dist < best_dist) {
+				best_dist = dist;
+				local t = "use";
+				if (cls == "func_button") {
+					t = "button";
+				} else if (cls == "func_door" || cls == "prop_door" || cls == "func_door_rotating" || cls == "prop_door_rotating") {
+					t = "door";
+				}
+				best = { ent = ent, type = t };
+			}
+		}
+	}
+	return best;
+}
+
+// 真人优先：最近真人距实体 < SURV_STUCK_HUMAN_RANGE → 不自动触发（等真人按，真人离开即恢复）
+function surv_stuck_human_near(ent)
+{
+	if (!SURV_STUCK_HUMAN_PRIORITY) return false;
+	local ep = ent.GetOrigin();
+	local p = null;
+	while (p = Entities.FindByClassname(p, "player")) {
+		if (p && p.IsPlayer() && p.IsSurvivor() && !IsPlayerABot(p) && !p.IsDead()) {
+			if ((p.GetOrigin() - ep).Length() < SURV_STUCK_HUMAN_RANGE) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// 主检测：停滞 → 自动触发机关 → 无效则引导 → 极端传送/重生
+function survivor_stuck_tick()
+{
+	if (!g_bot_start) return;              // 开局 sb_stop 期间（20 秒）不检测
+	if (!Director.HasAnySurvivorLeftSafeArea()) {
+		g_surv_stuck <- {};
+		return;
+	}
+	local t = Time();
+	if (has_tank()) {
+		// tank 战不计入停滞（重置各记录计时，避免战后误判）
+		foreach (id, rec in g_surv_stuck) {
+			if (rec) rec.last_time <- t;
+		}
+		return;
+	}
+	// 队伍领先者位置（引导/传送目标）
+	local lead_flow = -1.0;
+	local lead_pos = null;
+	local ent = null;
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (ent && ent.IsPlayer() && ent.IsSurvivor() && !ent.IsDead() && ent.GetHealth() > 0) {
+			local f = GetCurrentFlowDistanceForPlayer(ent);
+			if (f > lead_flow) {
+				lead_flow = f;
+				lead_pos = ent.GetOrigin();
+			}
+		}
+	}
+	ent = null;
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (!ent || !ent.IsPlayer() || !ent.IsSurvivor() || ent.IsDead() || !IsPlayerABot(ent)) {
+			continue;
+		}
+		local id = ent.GetPlayerUserId();
+		if ((id in g_player_incapped) && g_player_incapped[id]) {
+			continue;   // 倒地 bot 不触发机关（等队友救援）
+		}
+		local flow = GetCurrentFlowDistanceForPlayer(ent);
+		local rec = (id in g_surv_stuck) ? g_surv_stuck[id] : null;
+		if (!rec) {
+			g_surv_stuck[id] <- { last_flow = flow, last_time = t, state = 0, state_time = t, trigger_count = 0, interact_time = 0 };
+			continue;
+		}
+		if (flow - rec.last_flow > SURV_STUCK_FLOW_MIN) {
+			// 在推进 → 正常，刷新记录
+			rec.last_flow <- flow;
+			rec.last_time <- t;
+			rec.state <- 0;
+			rec.trigger_count <- 0;
+			continue;
+		}
+		local stuck_secs = t - rec.last_time;
+		if (stuck_secs < SURV_STUCK_TRIGGER_TIME) {
+			continue;
+		}
+		// ===== 停滞 ≥1 秒：自动触发机关 =====
+		if (SURV_STUCK_AUTO_TRIGGER && rec.trigger_count < SURV_STUCK_MAX_TRIGGERS && t > rec.interact_time + SURV_STUCK_INTERACT_CD) {
+			local found = surv_stuck_find_entity(ent);
+			if (found && !surv_stuck_human_near(found.ent)) {
+				// v26.14：普通门不触发——bot 原生 AI 1 秒内会自己开普通门；
+				// 门类需停滞 SURV_STUCK_DOOR_DELAY 仍未开（原生 AI 开不了 = 机关门/警报门）才触发
+				if (found.type == "door" && stuck_secs < SURV_STUCK_DOOR_DELAY) {
+					// 等待 bot 原生 AI 开门，不触发（下个 tick 重新评估）
+				} else {
+					local input = "Use";
+					local label = "机关";
+					if (found.type == "button") {
+						input = "Press";
+						label = "开关";
+					} else if (found.type == "door") {
+						input = "Open";
+						label = "门";
+					}
+				if (found.type == "door") {
+					// v26.14 调整：批量开门——双开门/连排门只开一扇会导致 bot 走不过再次停滞
+					// 以最近门为中心，同实体类 200 单位内的门一起 Open（最多 4 扇）
+					local fcls = found.ent.GetClassname();
+					local fpos = found.ent.GetOrigin();
+					local cnt = 0;
+					local e2 = null;
+					while (e2 = Entities.FindByClassname(e2, fcls)) {
+						if (!e2 || !e2.IsValid()) continue;
+						if ((e2.GetOrigin() - fpos).Length() < 200.0 && cnt < 4) {
+							DoEntFire("!self", input, "", 0.0, ent, e2);
+							cnt += 1;
+						}
+					}
+				} else {
+					DoEntFire("!self", input, "", 0.0, ent, found.ent);
+				}
+				rec.interact_time <- t;
+				rec.trigger_count += 1;
+				if (rec.state < 1) {   // 仅首次触发提示，重试不刷屏（0.5 秒冷却下最多 1 条/机关）
+					rec.state <- 1;
+					rec.state_time <- t;
+					local name = format("bot %d", id);
+					if ("GetPlayerName" in ent) {
+						local nm = ent.GetPlayerName();
+						if (nm && nm != "") name = nm;
+					}
+					ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 已自动触发%s", name, label));
+				}
+					continue;
+				}
+			}
+		}
+		// ===== 机关无效或无可触发实体：引导离开 =====
+		if (stuck_secs >= SURV_STUCK_GUIDE_TIME) {
+			if (rec.state < 2) {
+				rec.state <- 2;
+				rec.state_time <- t;
+				CommandABot({cmd = BOT_CMD_RESET, bot = ent});
+				local name = format("bot %d", id);
+				if ("GetPlayerName" in ent) {
+					local nm = ent.GetPlayerName();
+					if (nm && nm != "") name = nm;
+				}
+				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 推进受阻，正在引导…", name));
+			}
+			if (lead_pos) {
+				CommandABot({cmd = BOT_CMD_MOVE, bot = ent, pos = lead_pos});
+			}
+		}
+		// ===== 极端兜底：传送/重生 =====
+		if (stuck_secs >= SURV_STUCK_RESCUE3) {
+			local name = format("bot %d", id);
+			if ("GetPlayerName" in ent) {
+				local nm = ent.GetPlayerName();
+				if (nm && nm != "") name = nm;
+			}
+			if (lead_pos && "Teleport" in ent) {
+				local ang = Vector(0, 0, 0);
+				if ("GetAngles" in ent) ang = ent.GetAngles();
+				ent.Teleport(lead_pos, ang, Vector(0, 0, 0));
+				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 长时间卡住，已传送至队伍", name));
+			} else {
+				ent.Kill();
+				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 长时间卡住，已重新部署", name));
+			}
+			delete g_surv_stuck[id];
+		}
+	}
+}
+
 function stuck_check()
 {
 	local t = Time();
@@ -2122,19 +2660,23 @@ function Update()
 			g_all_bot_survivor_team = true;
 			Convars.SetValue("survivor_revive_duration", 3);
 			Convars.SetValue("survivor_revive_health", 39);
-			DirectorOptions.ZombieTankHealth = 2000;
+			DirectorOptions.ZombieTankHealth = 3000;
 		} else {
 			g_all_bot_survivor_team = false;
 			reset_bot_target();
 			Convars.SetValue("survivor_revive_duration", 5);
 			Convars.SetValue("survivor_revive_health", 30);
-			DirectorOptions.ZombieTankHealth = 2000;
+			DirectorOptions.ZombieTankHealth = 3000;
 		}
 		g_all_bot_check_time = Time() + 10.0;
 	}
 	if (t - g_stuck_check_time > STUCK_TIMER) {
 		g_stuck_check_time = t;
 		stuck_check();
+	}
+	if (t > g_surv_stuck_time) {   // v26.14：幸存者 bot 机关自动触发检测（0.5 秒）
+		g_surv_stuck_time = t + SURV_STUCK_TICK;
+		survivor_stuck_tick();
 	}
 	
 	if (!g_set_spawn_range) {
@@ -2158,5 +2700,19 @@ function Update()
 		g_zombie_spawn_range = 0;
 	}
 	
+	if (g_pills_delay > 0 && t > g_pills_delay) {   // v26.12：round_start 延迟补发给药
+		g_pills_delay <- 0.0;
+		give_start_pills();
+	}
 	update_survivor_bot_ai();
+	if (!g_round_end) {   // v26.4：round_end 后停止 bonus 更新与聊天，防止途中值覆盖通关满分汇总
+		if (t > g_bonus_update_time) {
+			g_bonus_update_time = t + BONUS_UPDATE_INTERVAL;
+			update_bonus_cvar(false);
+		}
+		if (t > g_bonus_chat_time) {
+			g_bonus_chat_time = t + BONUS_CHAT_INTERVAL;
+			update_bonus_cvar(true);
+		}
+	}
 }
