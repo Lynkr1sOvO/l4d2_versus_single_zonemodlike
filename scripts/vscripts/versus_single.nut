@@ -122,11 +122,15 @@ function force_set_cvar()
 	g_damage_bonus_pct = 100;
 	g_player_incapped = {};
 	g_incap_count = {};
-	// 每回合重置 H/D 打印基线
-	// shit! cvar in mode-file does not apply on developer mode!
+	g_wipe_forcing = false;
+	g_wipe_pending_at = 0.0;
+	g_wipe_retry_at = 0;
+	g_wipe_attempt = 0;
 
 	Convars.SetValue("sb_open_fire", 0);
 	Convars.SetValue("sb_unstick", 1);
+	// 确保全灭时导演会结算换边（cheat cvar；vscript SetValue 在 listen 上通常仍生效）
+	Convars.SetValue("director_no_death_check", 0);
 	
 	Convars.SetValue("sv_pausable", 1);
 	Convars.SetValue("mp_autoteambalance", 0);
@@ -492,7 +496,13 @@ function update_bonus_cvar(chat = false, force_max = false)
 function OnGameEvent_round_end(params)
 {
 	g_round_end <- true;
+	g_wipe_forcing = false;
+	g_wipe_pending_at = 0.0;
+	g_wipe_retry_at = 0;
+	g_wipe_attempt = 0;
 	debug_print("round end");
+	Convars.SetValue("sb_all_bot_game", 1);
+	Convars.SetValue("allow_all_bot_survivor_team", 1);
 	update_bonus_cvar(false);
 	// v26.4：不再依赖 winner 参数（vs 模式 winner 值实测不可靠）——force_max 在函数内以 alive>0 判定通关；失败（alive=0）自动走途中值
 	update_bonus_cvar(true, true);
@@ -530,8 +540,199 @@ function OnGameEvent_player_first_spawn( params)
 	}
 }
 
+// ===== v26.17：全员倒地/死亡持续 5 秒 → 强制「完成地图」(RollStatsCrawl) =====
+// 参考 Admin System：造 trigger_finale / env_fade / env_outtro_stats，
+// 发 FinaleEscapeFinished + RollStatsCrawl，结束本局（黑屏片尾统计）。
+g_wipe_forcing <- false
+g_wipe_pending_at <- 0.0   // 全员倒地/死亡成立后的触发时刻；0=未进入等待
+g_wipe_retry_at <- 0
+g_wipe_attempt <- 0
+WIPE_TRIGGER_DELAY <- 5.0
+WIPE_RETRY_INTERVAL <- 4.0
+WIPE_MAX_ATTEMPTS <- 3
+
+function survivor_is_downed_or_dead(ent)
+{
+	if (!ent || !ent.IsValid() || !ent.IsPlayer() || !ent.IsSurvivor()) {
+		return true;
+	}
+	if (ent.IsDead() || ent.GetHealth() <= 0) {
+		return true;
+	}
+	local id = ent.GetPlayerUserId();
+	if ((id in g_player_incapped) && g_player_incapped[id]) {
+		return true;
+	}
+	if (ent.IsIncapacitated()) {
+		return true;
+	}
+	// 倒地池血量兜底（标记漏维护时）
+	if (ent.GetHealth() > INCAPPED_HEALTH_THRESHOLD) {
+		return true;
+	}
+	return false;
+}
+
+// 全体幸存者均已倒地或死亡（仍站立存活则 false）
+function survivors_all_downed_or_dead()
+{
+	local found = false;
+	local ent = null;
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (ent && ent.IsPlayer() && ent.IsSurvivor()) {
+			found = true;
+			if (!survivor_is_downed_or_dead(ent)) {
+				return false;
+			}
+		}
+	}
+	return found;
+}
+
+// 仅当存在未倒地的存活 bot 时才允许夺回（倒地残局夺回只会拖延/干扰结算）
+function has_upright_survivor_bot()
+{
+	local bots = survivor_bots();
+	foreach (bot in bots) {
+		if (!bot || !bot.IsValid()) continue;
+		local id = bot.GetPlayerUserId();
+		local incapped = (id in g_player_incapped) && g_player_incapped[id];
+		if (!incapped && bot.GetHealth() > INCAPPED_HEALTH_THRESHOLD) {
+			incapped = true;
+		}
+		if (!incapped && bot.GetHealth() > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function cancel_pending_client_commands()
+{
+	local ent = Entities.FindByName(null, "versus_single_clientcommand");
+	if (ent && ent.IsValid()) {
+		DoEntFire("!self", "Kill", "", 0.0, null, ent);
+	}
+}
+
+function wipe_stop_director_spawn()
+{
+	DirectorOptions.cm_CommonLimit <- 0;
+	DirectorOptions.CommonLimit <- 0;
+	DirectorOptions.cm_MaxSpecials <- 0;
+	DirectorOptions.MaxSpecials <- 0;
+	DirectorOptions.SmokerLimit <- 0;
+	DirectorOptions.BoomerLimit <- 0;
+	DirectorOptions.HunterLimit <- 0;
+	DirectorOptions.SpitterLimit <- 0;
+	DirectorOptions.JockeyLimit <- 0;
+	DirectorOptions.ChargerLimit <- 0;
+	DirectorOptions.WitchLimit <- 0;
+	DirectorOptions.TankLimit <- 0;
+	DirectorOptions.cm_TankLimit <- 0;
+}
+
+function wipe_kill_infected()
+{
+	local ent = null;
+	while (ent = Entities.FindByClassname(ent, "player")) {
+		if (ent && ent.IsValid() && ent.IsPlayer() && !ent.IsSurvivor() && IsPlayerABot(ent)) {
+			DoEntFire("!self", "Kill", "", 0.0, null, ent);
+		}
+	}
+	ent = null;
+	while (ent = Entities.FindByClassname(ent, "infected")) {
+		if (ent && ent.IsValid()) {
+			DoEntFire("!self", "Kill", "", 0.0, null, ent);
+		}
+	}
+}
+
+// 移植自 Admin Menu Utils.RollStatsCrawl（完成地图）
+function force_wipe_roll_stats_crawl()
+{
+	Convars.SetValue("director_no_death_check", 0);
+	cancel_pending_client_commands();
+	wipe_stop_director_spawn();
+	wipe_kill_infected();
+
+	local event_proxy = SpawnEntityFromTable("info_game_event_proxy", {
+		event_name = "gameinstructor_nodraw"
+		range = "0"
+		spawnflags = "0"
+		origin = Vector(0, 0, 0)
+	});
+	if (event_proxy && event_proxy.IsValid()) {
+		DoEntFire("!self", "GenerateGameEvent", "", 0.0, null, event_proxy);
+		DoEntFire("!self", "Kill", "", 0.05, null, event_proxy);
+	}
+
+	local trigger_finale = SpawnEntityFromTable("trigger_finale", {
+		disableshadows = "1"
+		model = "models/props/terror/hamradio.mdl"
+		skin = "0"
+		VersusTravelCompletion = "0.2"
+		origin = Vector(0, 0, 0)
+	});
+	local env_fade = SpawnEntityFromTable("env_fade", {
+		duration = "0"
+		holdtime = "0"
+		renderamt = "255"
+		rendercolor = "0 0 0"
+		spawnflags = "8"
+		origin = Vector(0, 0, 0)
+	});
+	local outtro_stats = SpawnEntityFromTable("env_outtro_stats", {
+		origin = Vector(0, 0, 0)
+	});
+
+	if (env_fade && env_fade.IsValid()) {
+		DoEntFire("!self", "Alpha", "255", 0.0, null, env_fade);
+		DoEntFire("!self", "Fade", "", 0.0, null, env_fade);
+	}
+	if (trigger_finale && trigger_finale.IsValid()) {
+		DoEntFire("!self", "FinaleEscapeFinished", "", 0.0, null, trigger_finale);
+		DoEntFire("!self", "FinaleEscapeForceSurvivorPositions", "", 0.0, null, trigger_finale);
+	}
+	if (outtro_stats && outtro_stats.IsValid()) {
+		DoEntFire("!self", "RollStatsCrawl", "", 0.1, null, outtro_stats);
+	}
+}
+
+function begin_wipe_force()
+{
+	if (g_round_end || g_wipe_forcing) return;
+	g_wipe_forcing = true;
+	g_wipe_pending_at = 0.0;
+	g_wipe_attempt = 1;
+	force_wipe_roll_stats_crawl();
+	g_wipe_retry_at = Time() + WIPE_RETRY_INTERVAL;
+	ClientPrint(null, DirectorScript.HUD_PRINTTALK,
+		"[VS Single] 全员倒地/死亡已满 5 秒，强制完成地图…");
+	debug_print("wipe force begin → RollStatsCrawl");
+}
+
+function attempt_wipe_round_end()
+{
+	if (g_round_end) return;
+	if (g_wipe_attempt >= WIPE_MAX_ATTEMPTS) {
+		g_wipe_retry_at = 0;
+		ClientPrint(null, DirectorScript.HUD_PRINTTALK,
+			"[VS Single] 完成地图多次未结束回合，请手动换图/重开");
+		return;
+	}
+	g_wipe_attempt += 1;
+	force_wipe_roll_stats_crawl();
+	g_wipe_retry_at = Time() + WIPE_RETRY_INTERVAL;
+	ClientPrint(null, DirectorScript.HUD_PRINTTALK,
+		format("[VS Single] 再次强制完成地图 (#%d)…", g_wipe_attempt));
+}
+
 function takecontrol(player)
 {
+	// 全灭中 / 无直立 bot → 禁止夺回，避免延迟 jointeam 卡死换边
+	if (g_round_end || g_wipe_forcing || !player || !player.IsValid()) return;
+	if (!has_upright_survivor_bot()) return;
 	client_command(player, "jointeam 3", 1.0);
 	client_command(player, "jointeam 2", 1.01);
 	client_command(player, "jointeam 2", 1.1);
@@ -562,12 +763,12 @@ function OnGameEvent_player_death( params )
 			g_si_pos[params.userid] <- null;
 			g_si_pos_check_time[params.userid] <- null;
 		}
-		if (player.IsSurvivor() && !IsPlayerABot(player) && !g_round_end) {
-			local bots = survivor_bots();
-			if (bots.len() > 0) {
+		if (player && player.IsSurvivor() && !IsPlayerABot(player) && !g_round_end && !g_wipe_forcing) {
+			if (has_upright_survivor_bot()) {
 				takecontrol(player);
 			}
 		}
+		// 全员倒地/死亡的 5 秒计时由 Update 统一处理，此处不立即触发
 	}
 }
 
@@ -861,6 +1062,7 @@ function reset_triggers()
 	g_c7m1_trigger3 = false;
 	g_c7m1_trigger4 = false;
 	g_c7m2_trigger1 = false;
+	g_c7m3_trigger1 = false;
 	g_c7m3_trigger2 = false;
 	g_c7m3_trigger3 = false;
 	g_c7m3_trigger4 = false;
@@ -886,6 +1088,8 @@ function reset_triggers()
 	g_c11m2_trigger2 = false;
 	g_c11m3_trigger1 = false;
 	g_c11m4_trigger1 = false;
+	g_c11m5_trigger1 = false;
+	g_c11m5_trigger2 = false;
 	g_c3m1_trigger1 = false;
 	g_c3m1_trigger1_time = false;
 	g_c3m1_trigger2 = false;
@@ -913,7 +1117,7 @@ function reset_triggers()
 /* limited */
 function client_command(player, command, delay = 0.01)
 {
-	local ent = Entities.FindByClassname(null, "point_clientcommand");
+	local ent = Entities.FindByName(null, "versus_single_clientcommand");
 	if (!ent) {
 		ent = CreateSingleSimpleEntityFromTable({classname = "point_clientcommand", targetname = "versus_single_clientcommand"});
 		debug_print("created point_clientcommand");
@@ -2254,8 +2458,8 @@ STUCK_RADIUS <- 50.0
 // v26.14 调整：检测半径 250→350；触发延迟 1s→立即；重试冷却 20→5→0.5；门批量 Open（双开门）；
 //              门类延迟 3s 判定（普通门 bot 原生 AI 会自己开，不触发；3s 仍不开才是机关门/警报门）
 // 目标：bot 到达机关（开关/对讲机/电台/警报门）附近立即自动触发，保证地图推进
-// 流程：flow 停滞检测(0.5s tick) → 实体扫描(350 半径) → 触发(Press/Use/Open) → 反馈验证
-//       → 机关无效(3 次)引导离开 → 极端(150s)传送/重生兜底
+// 流程：flow 停滞检测(0.5s tick) → 实体扫描(350 半径，视线+非电梯门) → 触发(Press/Use/Open) → 反馈验证
+//       → 机关无效(3 次)引导离开
 SURV_STUCK_TICK <- 0.5            // 检测周期（秒）
 SURV_STUCK_FLOW_MIN <- 60.0       // tick 间 flow 推进阈值（0.5s 内正常走路 ~125）
 SURV_STUCK_TRIGGER_TIME <- 0.0    // 停滞立即尝试触发机关（响应延迟 = 检测周期 0.5s）
@@ -2265,7 +2469,6 @@ SURV_STUCK_HUMAN_RANGE <- 500.0   // 真人优先半径（仅 SURV_STUCK_HUMAN_P
 SURV_STUCK_INTERACT_CD <- 0.5    // 触发重试节流（v26.14 调整：20→5→0.5，几乎每个检测周期都尝试触发）
 SURV_STUCK_MAX_TRIGGERS <- 3      // 同机关最多触发次数
 SURV_STUCK_GUIDE_TIME <- 40.0     // 机关无效后引导离开
-SURV_STUCK_RESCUE3 <- 150.0       // 传送/重生兜底
 SURV_STUCK_AUTO_TRIGGER <- true   // 总开关
 SURV_STUCK_HUMAN_PRIORITY <- false // 真人优先（默认关=纯快速模式；第三方 finale 图提前触发严重时改 true）
 g_surv_stuck <- {}                // [userid] -> { last_flow, last_time, state, state_time, trigger_count, interact_time }
@@ -2283,8 +2486,69 @@ function surv_stuck_clear(id)
 	}
 }
 
+// 电梯门判定：名称/模型/父实体含 elevator、elevdoor、lift+door 等（避免 bot 提前拉开电梯门）
+function surv_stuck_str_has_elevator(s)
+{
+	if (!s || s == "") return false;
+	s = s.tolower();
+	if (s.find("elevator") != null) return true;
+	if (s.find("elevdoor") != null || s.find("elev_door") != null) return true;
+	if (s.find("lift") != null && (s.find("door") != null || s.find("gate") != null)) return true;
+	return false;
+}
+
+function surv_stuck_is_elevator_door(ent)
+{
+	if (!ent || !ent.IsValid()) return false;
+	local cls = ent.GetClassname();
+	if (cls != "func_door" && cls != "prop_door" && cls != "func_door_rotating" && cls != "prop_door_rotating") {
+		return false;
+	}
+	local name = "";
+	if ("GetName" in ent) name = ent.GetName();
+	if (surv_stuck_str_has_elevator(name)) return true;
+	if ("GetModelName" in ent) {
+		if (surv_stuck_str_has_elevator(ent.GetModelName())) return true;
+	}
+	if ("GetMoveParent" in ent) {
+		local p = ent.GetMoveParent();
+		if (p && p.IsValid() && "GetName" in p && surv_stuck_str_has_elevator(p.GetName())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// 视线检测：隔墙不触发（TraceLine；命中目标实体 / 几乎打到终点 / 未命中 视为可见）
+function surv_stuck_has_los(bot, ent)
+{
+	if (!bot || !bot.IsValid() || !ent || !ent.IsValid()) return false;
+	local start = bot.EyePosition();
+	local end = ent.GetOrigin() + Vector(0, 0, 24);
+	local trace = {
+		start = start
+		end = end
+		ignore = bot
+		mask = TRACE_MASK_VISION
+	};
+	TraceLine(trace);
+	if (!("hit" in trace) || !trace.hit) {
+		return true;
+	}
+	if (("enthit" in trace) && trace.enthit == ent) {
+		return true;
+	}
+	if (("pos" in trace) && (trace.pos - end).Length() < 40.0) {
+		return true;
+	}
+	if (("fraction" in trace) && trace.fraction >= 0.95) {
+		return true;
+	}
+	return false;
+}
+
 // 扫描 bot 附近最近的可互动机关实体；返回 { ent, type } 或 null
-// type: "button"→Press / "use"→Use / "door"→Open（含警报门，用户确认接受）
+// type: "button"→Press / "use"→Use / "door"→Open（含警报门；电梯门排除；需视线）
 function surv_stuck_find_entity(bot)
 {
 	local bot_pos = bot.GetOrigin();
@@ -2296,17 +2560,20 @@ function surv_stuck_find_entity(bot)
 		local ent = null;
 		while (ent = Entities.FindByClassname(ent, cls)) {
 			if (!ent || !ent.IsValid()) continue;
-			local dist = (ent.GetOrigin() - bot_pos).Length();
-			if (dist < best_dist) {
-				best_dist = dist;
-				local t = "use";
-				if (cls == "func_button") {
-					t = "button";
-				} else if (cls == "func_door" || cls == "prop_door" || cls == "func_door_rotating" || cls == "prop_door_rotating") {
-					t = "door";
-				}
-				best = { ent = ent, type = t };
+			if (cls == "func_door" || cls == "prop_door" || cls == "func_door_rotating" || cls == "prop_door_rotating") {
+				if (surv_stuck_is_elevator_door(ent)) continue;
 			}
+			local dist = (ent.GetOrigin() - bot_pos).Length();
+			if (dist >= best_dist) continue;
+			if (!surv_stuck_has_los(bot, ent)) continue;
+			best_dist = dist;
+			local t = "use";
+			if (cls == "func_button") {
+				t = "button";
+			} else if (cls == "func_door" || cls == "prop_door" || cls == "func_door_rotating" || cls == "prop_door_rotating") {
+				t = "door";
+			}
+			best = { ent = ent, type = t };
 		}
 	}
 	return best;
@@ -2328,7 +2595,7 @@ function surv_stuck_human_near(ent)
 	return false;
 }
 
-// 主检测：停滞 → 自动触发机关 → 无效则引导 → 极端传送/重生
+// 主检测：停滞 → 自动触发机关 → 无效则引导
 function survivor_stuck_tick()
 {
 	if (!g_bot_start) return;              // 开局 sb_stop 期间（20 秒）不检测
@@ -2344,7 +2611,7 @@ function survivor_stuck_tick()
 		}
 		return;
 	}
-	// 队伍领先者位置（引导/传送目标）
+	// 队伍领先者位置（引导目标）
 	local lead_flow = -1.0;
 	local lead_pos = null;
 	local ent = null;
@@ -2404,13 +2671,15 @@ function survivor_stuck_tick()
 					}
 				if (found.type == "door") {
 					// v26.14 调整：批量开门——双开门/连排门只开一扇会导致 bot 走不过再次停滞
-					// 以最近门为中心，同实体类 200 单位内的门一起 Open（最多 4 扇）
+					// 以最近门为中心，同实体类 200 单位内的门一起 Open（最多 4 扇）；跳过电梯门
 					local fcls = found.ent.GetClassname();
 					local fpos = found.ent.GetOrigin();
 					local cnt = 0;
 					local e2 = null;
 					while (e2 = Entities.FindByClassname(e2, fcls)) {
 						if (!e2 || !e2.IsValid()) continue;
+						if (surv_stuck_is_elevator_door(e2)) continue;
+						if (!surv_stuck_has_los(ent, e2)) continue;
 						if ((e2.GetOrigin() - fpos).Length() < 200.0 && cnt < 4) {
 							DoEntFire("!self", input, "", 0.0, ent, e2);
 							cnt += 1;
@@ -2451,24 +2720,6 @@ function survivor_stuck_tick()
 			if (lead_pos) {
 				CommandABot({cmd = BOT_CMD_MOVE, bot = ent, pos = lead_pos});
 			}
-		}
-		// ===== 极端兜底：传送/重生 =====
-		if (stuck_secs >= SURV_STUCK_RESCUE3) {
-			local name = format("bot %d", id);
-			if ("GetPlayerName" in ent) {
-				local nm = ent.GetPlayerName();
-				if (nm && nm != "") name = nm;
-			}
-			if (lead_pos && "Teleport" in ent) {
-				local ang = Vector(0, 0, 0);
-				if ("GetAngles" in ent) ang = ent.GetAngles();
-				ent.Teleport(lead_pos, ang, Vector(0, 0, 0));
-				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 长时间卡住，已传送至队伍", name));
-			} else {
-				ent.Kill();
-				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 长时间卡住，已重新部署", name));
-			}
-			delete g_surv_stuck[id];
 		}
 	}
 }
@@ -2678,6 +2929,26 @@ function Update()
 		g_surv_stuck_time = t + SURV_STUCK_TICK;
 		survivor_stuck_tick();
 	}
+
+	// v26.17：全员倒地/死亡持续 WIPE_TRIGGER_DELAY 秒后强制 RollStatsCrawl
+	if (!g_round_end && !g_wipe_forcing && Director.HasAnySurvivorLeftSafeArea()) {
+		if (survivors_all_downed_or_dead()) {
+			if (g_wipe_pending_at <= 0) {
+				g_wipe_pending_at = t + WIPE_TRIGGER_DELAY;
+				ClientPrint(null, DirectorScript.HUD_PRINTTALK,
+					format("[VS Single] 全员倒地/死亡，%.0f 秒后强制完成地图…", WIPE_TRIGGER_DELAY));
+				debug_print("wipe pending armed");
+			} else if (t >= g_wipe_pending_at) {
+				begin_wipe_force();
+			}
+		} else if (g_wipe_pending_at > 0) {
+			g_wipe_pending_at = 0.0;
+			debug_print("wipe pending cancelled (someone upright)");
+		}
+	}
+	if (g_wipe_forcing && g_wipe_retry_at > 0 && t >= g_wipe_retry_at) {
+		attempt_wipe_round_end();
+	}
 	
 	if (!g_set_spawn_range) {
 		if (!("ZombieSpawnRange" in DirectorOptions)) {
@@ -2705,7 +2976,7 @@ function Update()
 		give_start_pills();
 	}
 	update_survivor_bot_ai();
-	if (!g_round_end) {   // v26.4：round_end 后停止 bonus 更新与聊天，防止途中值覆盖通关满分汇总
+	if (!g_round_end && !g_wipe_forcing) {   // v26.4/26.16：round_end 或全灭强制完成中停止 bonus 刷新
 		if (t > g_bonus_update_time) {
 			g_bonus_update_time = t + BONUS_UPDATE_INTERVAL;
 			update_bonus_cvar(false);

@@ -11,7 +11,7 @@ WeaponData
 	"MaxMovementSpread"		"1.5"  //increased accuracy
 	"PelletScatterPitch"		"3"  //increased accuracy
 	"PelletScatterYaw"		"5"
-	"ReloadDuration"		"0.473"
+	"ReloadDuration"		"0.45"
 	"AddonAttachment"		"primary"
 	"Team"					"Survivor"
 	

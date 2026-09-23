@@ -2,7 +2,7 @@
 {
 	addonSteamAppID         550
 	addontitle              "Versus Single Zonemod-like"
-	addonversion            1.2
+	addonversion            1.4
 	addonauthor             "Nikaidou Hiro"
 	addonURL0               "https://steamcommunity.com/sharedfiles/filedetails/?id=3781546471"
 	addonDescription        "Single player zonemod-like versus game"

@@ -5,11 +5,11 @@ WeaponData
 	"SpreadPerShot"			"0.22"
 	"MaxSpread"				"30"
 	"SpreadDecay"			"5"
-	"MinDuckingSpread"		"0.26"
-	"MinStandingSpread"		"1.0"
-	"MinInAirSpread"		"1.7"
-	"MaxMovementSpread"		"2"
-	"ReloadDuration"		"1.9"
+	"MinDuckingSpread"		"0.235"
+	"MinStandingSpread"		"0.88"
+	"MinInAirSpread"		"1.5"
+	"MaxMovementSpread"		"1.8"
+	"ReloadDuration"		"1.7"
 	"AddonAttachment"		"primary"
 	"Team"					"Survivor"
 	
@@ -59,7 +59,7 @@ WeaponData
 	"PenetrationPower"			"30"
 	"PenetrationMaxDistance"	"0"	// none
 
-	"Damage"			"22"
+	"Damage"			"23"
 	"Range"				"2500"
 	"RangeModifier"			"0.81"
 	"Bullets"			"1"
