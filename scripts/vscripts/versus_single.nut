@@ -2486,14 +2486,35 @@ function surv_stuck_clear(id)
 	}
 }
 
-// 电梯门判定：名称/模型/父实体含 elevator、elevdoor、lift+door 等（避免 bot 提前拉开电梯门）
+// 电梯门判定：名称/模型/父实体关键字，或靠近 func_elevator / info_elevator_floor
+// （官图 c8m4 医院电梯门多为无名 brush，仅靠名字拦不住）
+ELEVATOR_DOOR_PROXIMITY <- 450.0
+
 function surv_stuck_str_has_elevator(s)
 {
 	if (!s || s == "") return false;
 	s = s.tolower();
 	if (s.find("elevator") != null) return true;
 	if (s.find("elevdoor") != null || s.find("elev_door") != null) return true;
+	if (s.find("door_elev") != null || s.find("doorelev") != null) return true;
 	if (s.find("lift") != null && (s.find("door") != null || s.find("gate") != null)) return true;
+	return false;
+}
+
+function surv_stuck_near_elevator_system(pos)
+{
+	local elev = null;
+	while (elev = Entities.FindByClassname(elev, "func_elevator")) {
+		if (elev && elev.IsValid() && (elev.GetOrigin() - pos).Length() < ELEVATOR_DOOR_PROXIMITY) {
+			return true;
+		}
+	}
+	local floor = null;
+	while (floor = Entities.FindByClassname(floor, "info_elevator_floor")) {
+		if (floor && floor.IsValid() && (floor.GetOrigin() - pos).Length() < ELEVATOR_DOOR_PROXIMITY) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -2512,10 +2533,13 @@ function surv_stuck_is_elevator_door(ent)
 	}
 	if ("GetMoveParent" in ent) {
 		local p = ent.GetMoveParent();
-		if (p && p.IsValid() && "GetName" in p && surv_stuck_str_has_elevator(p.GetName())) {
-			return true;
+		if (p && p.IsValid()) {
+			if (p.GetClassname() == "func_elevator") return true;
+			if ("GetName" in p && surv_stuck_str_has_elevator(p.GetName())) return true;
 		}
 	}
+	// 官图医院等：电梯井门无名，用与电梯实体的距离判定
+	if (surv_stuck_near_elevator_system(ent.GetOrigin())) return true;
 	return false;
 }
 
