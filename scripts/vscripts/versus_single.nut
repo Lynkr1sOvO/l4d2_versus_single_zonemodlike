@@ -273,6 +273,95 @@ function give_start_pills()
 }
 
 g_pills_delay <- 0.0   // v26.12：round_start 延迟补发计时（帧循环执行）
+// 开局安全屋近战：等真人玩家进入游戏（读图完成、生还者已就位）后再计时刷新
+g_start_melee_at <- 0.0;
+g_start_melee_done <- false;
+
+function start_melee_human_ready()
+{
+	local p = null;
+	while (p = Entities.FindByClassname(p, "player")) {
+		if (p.IsValid() && !IsPlayerABot(p) && NetProps.GetPropInt(p, "m_iTeamNum") >= 2) return true;
+	}
+	return false;
+}
+
+// 官方战役 mission 文件的 meleeweapons 清单里没有砍刀时的替代近战（只能刷清单内的近战）
+START_MELEE_FALLBACK <- {
+	c1 = "katana", c2 = "katana", c4 = "katana", c6 = "katana",
+	c7 = "katana", c8 = "katana", c9 = "fireaxe", c11 = "katana"
+}
+START_MELEE_MODELS <- {
+	machete = "models/weapons/melee/w_machete.mdl",
+	katana = "models/weapons/melee/w_katana.mdl",
+	fireaxe = "models/weapons/melee/w_fireaxe.mdl"
+}
+
+// 返回 [melee_weapon, model]；三方图无法得知清单，用 "any" 由引擎从本图清单里随机
+function start_melee_choice()
+{
+	local map = Director.GetMapName().tolower();
+	local ex = regexp("^(c[0-9]+)m[0-9]+_");
+	local res = ex.capture(map);
+	if (res == null) return ["any", START_MELEE_MODELS.fireaxe];
+	local campaign = map.slice(res[1].begin, res[1].end);
+	local official = campaign.slice(1).tointeger() <= 14;
+	if (!official) return ["any", START_MELEE_MODELS.fireaxe];
+	if (campaign in START_MELEE_FALLBACK) {
+		local w = START_MELEE_FALLBACK[campaign];
+		return [w, START_MELEE_MODELS[w]];
+	}
+	return ["machete", START_MELEE_MODELS.machete];
+}
+
+// 开局安全屋固定刷一把近战（优先砍刀）：放在最靠近生还者群中心的那名生还者脚下
+function spawn_start_saferoom_machete()
+{
+	if (Director.HasAnySurvivorLeftSafeArea()) return;
+	local survs = [];
+	local sum = Vector(0, 0, 0);
+	local p = null;
+	while (p = Entities.FindByClassname(p, "player")) {
+		if (!p.IsValid() || !p.IsSurvivor() || p.IsDead()) continue;
+		survs.append(p);
+		sum = sum + p.GetOrigin();
+	}
+	if (survs.len() == 0) return;
+	local n = survs.len();
+	local center = Vector(sum.x / n, sum.y / n, sum.z / n);
+	local pos = survs[0].GetOrigin();
+	local best = (pos - center).Length();
+	foreach (s in survs) {
+		local d = (s.GetOrigin() - center).Length();
+		if (d < best) { best = d; pos = s.GetOrigin(); }
+	}
+	local choice = start_melee_choice();
+	local melee = choice[0];
+	local model = choice[1];
+	local kv = {
+		classname = "weapon_melee_spawn",
+		origin = pos + Vector(0, 0, 2),
+		angles = Vector(0, RandomInt(0, 359), -90),
+		model = model,
+		solid = 6,
+		melee_weapon = melee,
+		spawnflags = 0,
+		count = 1
+	};
+	local ent = null;
+	local err = null;
+	try {
+		PrecacheEntityFromTable(kv);
+		ent = SpawnEntityFromTable("weapon_melee_spawn", kv);
+	} catch (e) {
+		err = e;
+	}
+	local msg = "start saferoom melee " + melee + " @ " + format("%.0f %.0f %.0f", pos.x, pos.y, pos.z);
+	if (err != null) msg += " error: " + err;
+	else if (ent && ent.IsValid()) msg += " ok";
+	else msg += " failed";
+	debug_print(msg);
+}
 
 function OnGameEvent_round_start( params )
 {
@@ -286,6 +375,9 @@ function OnGameEvent_round_start( params )
 	si_reset();
 	surv_stuck_reset();   // v26.14：清空 bot 卡死检测记录
 	remove_entity();
+	g_saferoom_pills_retry_at = Time() + 2.0;   // 延迟再清一次，防止刷物晚于 round_start
+	g_start_melee_at = 0.0;
+	g_start_melee_done = false;
 	Convars.SetValue("sb_stop", 1);
 	g_bot_start = false;
 	g_bot_start_time = Time() + BOT_STOP_DELAY;
@@ -708,7 +800,7 @@ function begin_wipe_force()
 	force_wipe_roll_stats_crawl();
 	g_wipe_retry_at = Time() + WIPE_RETRY_INTERVAL;
 	ClientPrint(null, DirectorScript.HUD_PRINTTALK,
-		"[VS Single] 全员倒地/死亡已满 5 秒，强制完成地图…");
+		"[VS Single] All survivors down or dead for 5 seconds, forcing map completion...");
 	debug_print("wipe force begin → RollStatsCrawl");
 }
 
@@ -718,14 +810,14 @@ function attempt_wipe_round_end()
 	if (g_wipe_attempt >= WIPE_MAX_ATTEMPTS) {
 		g_wipe_retry_at = 0;
 		ClientPrint(null, DirectorScript.HUD_PRINTTALK,
-			"[VS Single] 完成地图多次未结束回合，请手动换图/重开");
+			"[VS Single] Map completion failed to end the round, please change or restart the map manually");
 		return;
 	}
 	g_wipe_attempt += 1;
 	force_wipe_roll_stats_crawl();
 	g_wipe_retry_at = Time() + WIPE_RETRY_INTERVAL;
 	ClientPrint(null, DirectorScript.HUD_PRINTTALK,
-		format("[VS Single] 再次强制完成地图 (#%d)…", g_wipe_attempt));
+		format("[VS Single] Retrying forced map completion (#%d)...", g_wipe_attempt));
 }
 
 function takecontrol(player)
@@ -2275,6 +2367,114 @@ function remove_entity()
 	while((ent = Entities.FindByClassname(ent, "prop_car_alarm")) != null) {
 		DoEntFire("!self", "kill", "", 0, null, ent);
 	}
+
+	remove_saferoom_pills();
+}
+
+// ===== 清除开头/结尾安全屋内的地图止痛药（不影响开局 give_start_pills 发给玩家的药）=====
+SAFEROOM_PILL_DOOR_RADIUS <- 700.0   // 距检查点门（prop_door_rotating_checkpoint）半径
+SAFEROOM_PILL_FLOW_LOW <- 0.06       // 路程比例低于此 → 视为开头安全屋一带
+SAFEROOM_PILL_FLOW_HIGH <- 0.94      // 路程比例高于此 → 视为结尾安全屋一带
+g_saferoom_pills_retry_at <- 0.0     // 延迟再扫一次（等刷物生成）
+
+function saferoom_collect_anchors()
+{
+	local anchors = [];
+	local door = null;
+	while (door = Entities.FindByClassname(door, "prop_door_rotating_checkpoint")) {
+		if (door && door.IsValid()) {
+			anchors.append(door.GetOrigin());
+		}
+	}
+	local cl = null;
+	while (cl = Entities.FindByClassname(cl, "info_changelevel")) {
+		if (cl && cl.IsValid()) {
+			anchors.append(cl.GetOrigin());
+		}
+	}
+	local tc = null;
+	while (tc = Entities.FindByClassname(tc, "trigger_changelevel")) {
+		if (tc && tc.IsValid()) {
+			anchors.append(tc.GetOrigin());
+		}
+	}
+	return anchors;
+}
+
+function saferoom_estimate_max_flow(anchors)
+{
+	local maxf = 0.0;
+	foreach (pos in anchors) {
+		local f = GetFlowDistanceForPosition(pos);
+		if (f > maxf) maxf = f;
+	}
+	// 无锚点时用任意生还者出生点兜底
+	if (maxf < 1.0) {
+		local sp = null;
+		while (sp = Entities.FindByClassname(sp, "info_survivor_position")) {
+			if (sp && sp.IsValid()) {
+				local f = GetFlowDistanceForPosition(sp.GetOrigin());
+				if (f > maxf) maxf = f;
+			}
+		}
+	}
+	if (maxf < 1.0) maxf = 1.0;
+	return maxf;
+}
+
+function saferoom_is_pill_in_saferoom(pos, anchors, max_flow)
+{
+	foreach (a in anchors) {
+		if ((pos - a).Length() < SAFEROOM_PILL_DOOR_RADIUS) {
+			return true;
+		}
+	}
+	local flow = GetFlowDistanceForPosition(pos);
+	local pct = flow / max_flow;
+	if (pct <= SAFEROOM_PILL_FLOW_LOW || pct >= SAFEROOM_PILL_FLOW_HIGH) {
+		return true;
+	}
+	return false;
+}
+
+// 玩家手上/背包里的药也是 weapon_pain_pills 实体，必须跳过
+function saferoom_pill_is_held(ent)
+{
+	if (ent.GetClassname() != "weapon_pain_pills") return false;
+	local owner = NetProps.GetPropEntity(ent, "m_hOwner");
+	if (owner && owner.IsValid()) return true;
+	local parent = ent.GetMoveParent();
+	if (parent && parent.IsValid() && parent.IsPlayer()) return true;
+	return false;
+}
+
+function remove_saferoom_pills()
+{
+	local anchors = saferoom_collect_anchors();
+	local max_flow = saferoom_estimate_max_flow(anchors);
+	local classes = ["weapon_pain_pills_spawn", "weapon_pain_pills"];
+	local to_kill = [];
+	foreach (cls in classes) {
+		local ent = null;
+		while (ent = Entities.FindByClassname(ent, cls)) {
+			if (!ent || !ent.IsValid()) continue;
+			if (saferoom_pill_is_held(ent)) continue;
+			local pos = ent.GetOrigin();
+			if (saferoom_is_pill_in_saferoom(pos, anchors, max_flow)) {
+				to_kill.append(ent);
+			}
+		}
+	}
+	local n = 0;
+	foreach (ent in to_kill) {
+		if (ent && ent.IsValid()) {
+			DoEntFire("!self", "Kill", "", 0.0, null, ent);
+			n += 1;
+		}
+	}
+	if (n > 0) {
+		debug_print(format("removed %d saferoom pain pills", n));
+	}
 }
 
 BOT_MOVE_TYPE_NORMAL <- 0
@@ -2685,13 +2885,13 @@ function survivor_stuck_tick()
 					// 等待 bot 原生 AI 开门，不触发（下个 tick 重新评估）
 				} else {
 					local input = "Use";
-					local label = "机关";
+					local label = "a mechanism";
 					if (found.type == "button") {
 						input = "Press";
-						label = "开关";
+						label = "a button";
 					} else if (found.type == "door") {
 						input = "Open";
-						label = "门";
+						label = "a door";
 					}
 				if (found.type == "door") {
 					// v26.14 调整：批量开门——双开门/连排门只开一扇会导致 bot 走不过再次停滞
@@ -2722,7 +2922,7 @@ function survivor_stuck_tick()
 						local nm = ent.GetPlayerName();
 						if (nm && nm != "") name = nm;
 					}
-					ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 已自动触发%s", name, label));
+					ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] Survivor %s auto-triggered %s", name, label));
 				}
 					continue;
 				}
@@ -2739,7 +2939,7 @@ function survivor_stuck_tick()
 					local nm = ent.GetPlayerName();
 					if (nm && nm != "") name = nm;
 				}
-				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] 生还者 %s 推进受阻，正在引导…", name));
+				ClientPrint(null, DirectorScript.HUD_PRINTTALK, format("[VS Single] Survivor %s is stuck, guiding...", name));
 			}
 			if (lead_pos) {
 				CommandABot({cmd = BOT_CMD_MOVE, bot = ent, pos = lead_pos});
@@ -2960,7 +3160,7 @@ function Update()
 			if (g_wipe_pending_at <= 0) {
 				g_wipe_pending_at = t + WIPE_TRIGGER_DELAY;
 				ClientPrint(null, DirectorScript.HUD_PRINTTALK,
-					format("[VS Single] 全员倒地/死亡，%.0f 秒后强制完成地图…", WIPE_TRIGGER_DELAY));
+					format("[VS Single] All survivors down or dead, forcing map completion in %.0f seconds...", WIPE_TRIGGER_DELAY));
 				debug_print("wipe pending armed");
 			} else if (t >= g_wipe_pending_at) {
 				begin_wipe_force();
@@ -2995,9 +3195,25 @@ function Update()
 		g_zombie_spawn_range = 0;
 	}
 	
+	if (g_saferoom_pills_retry_at > 0 && t >= g_saferoom_pills_retry_at) {
+		g_saferoom_pills_retry_at = 0.0;
+		remove_saferoom_pills();
+	}
+
 	if (g_pills_delay > 0 && t > g_pills_delay) {   // v26.12：round_start 延迟补发给药
 		g_pills_delay <- 0.0;
 		give_start_pills();
+	}
+	if (!g_start_melee_done && g_start_melee_at <= 0 && start_melee_human_ready()) {
+		g_start_melee_at = t + 3.0;
+	}
+	if (!g_start_melee_done && g_start_melee_at > 0 && t >= g_start_melee_at) {
+		g_start_melee_done = true;
+		try {
+			spawn_start_saferoom_machete();
+		} catch (e) {
+			debug_print("start saferoom melee script error: " + e);
+		}
 	}
 	update_survivor_bot_ai();
 	if (!g_round_end && !g_wipe_forcing) {   // v26.4/26.16：round_end 或全灭强制完成中停止 bonus 刷新
